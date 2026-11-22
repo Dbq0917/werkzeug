@@ -1,5 +1,13 @@
 .. currentmodule:: werkzeug
 
+Version 3.2.1
+-------------
+
+-   The development ``ProxyMiddleware`` streams target responses in
+    ``chunk_size`` pieces instead of iterating the raw response object. A
+    slow client now applies backpressure instead of the whole response
+    being buffered in the proxy process.
+
 Version 3.2.0
 -------------
 

@@ -10,6 +10,7 @@ Basic HTTP Proxy
 
 from __future__ import annotations
 
+import collections.abc as cabc
 import typing as t
 import wsgiref.types as wt
 from http import client
@@ -72,7 +73,10 @@ class ProxyMiddleware:
     :param app: The WSGI application to wrap.
     :param targets: Proxy target configurations. See description above.
     :param chunk_size: Size of chunks to read from input stream and
-        write to target.
+        write to target, and to read from the target response and write
+        to the client. The next chunk is only read after the previous one
+        has been written, so a slow client applies backpressure instead of
+        having the whole response buffered in memory.
     :param timeout: Seconds before an operation to a target fails.
 
     .. versionadded:: 0.14
@@ -177,7 +181,20 @@ class ProxyMiddleware:
                 for k, v in headers
                 if not is_hop_by_hop_header(k, connection_header)
             )
-            return Response(resp, status=resp.status, headers=headers)
+
+            def stream() -> cabc.Iterator[bytes]:
+                try:
+                    while data := resp.read(self.chunk_size):
+                        # Only pull the next chunk from the target after the
+                        # previous one has been written to the client. A slow
+                        # client applies backpressure instead of having the
+                        # whole response buffered in this process.
+                        yield data
+                finally:
+                    resp.close()
+                    con.close()
+
+            return Response(stream(), status=resp.status, headers=headers)
 
         return application
 
