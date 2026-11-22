@@ -19,8 +19,11 @@ from werkzeug import run_simple
 from werkzeug._reloader import _find_stat_paths
 from werkzeug._reloader import WatchdogReloaderLoop
 from werkzeug.datastructures import FileStorage
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.serving import DechunkedInput
 from werkzeug.serving import make_ssl_devcert
 from werkzeug.test import stream_encode_multipart
+from werkzeug.wsgi import _LimitedStream
 
 if t.TYPE_CHECKING:
     from conftest import DevServerClient
@@ -264,6 +267,45 @@ def test_chunked_request(
     assert environ["HTTP_TRANSFER_ENCODING"] == "chunked"
     assert environ.get("CONTENT_LENGTH") == expect_content_len
     assert environ["wsgi.input_terminated"]
+
+
+@pytest.mark.parametrize("read_size", [64 * 1024, 1024 * 1024, 3 * 1024 * 1024])
+def test_chunked_limit_stops_at_chunk_boundary(read_size: int) -> None:
+    """When ``max_content_length`` truncates a chunked request body, the
+    stream stops at a chunk boundary instead of cutting a chunk in half.
+    Chunk data is not read ahead to align to the limit.
+    """
+    # 1 MB chunks, the limit falls in the middle of the 4th chunk.
+    chunk_len = 1024 * 1024
+    limit = 3 * chunk_len + chunk_len // 2
+    body = (
+        b"".join(
+            b"%x\r\n" % chunk_len + bytes([i]) * chunk_len + b"\r\n" for i in range(5)
+        )
+        + b"0\r\n\r\n"
+    )
+    rfile = BytesIO(body)
+    dechunked = DechunkedInput(rfile)
+    stream = _LimitedStream(dechunked, limit, is_max=True)
+
+    out = bytearray()
+
+    with pytest.raises(RequestEntityTooLarge):
+        while True:
+            data = stream.read(read_size)
+
+            if not data:
+                break
+
+            out.extend(data)
+
+    # The stream stopped at the end of the 3rd chunk, not in the middle
+    # of the 4th.
+    assert bytes(out) == b"".join(bytes([i]) * chunk_len for i in range(3))
+    # The 4th chunk's data was not read to align to the limit, only its
+    # header line was consumed.
+    assert dechunked._len == chunk_len
+    assert rfile.read(8) == bytes([3]) * 8
 
 
 @mark_dev_server

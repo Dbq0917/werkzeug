@@ -3,6 +3,9 @@
 Version 3.2.0
 -------------
 
+-   When ``max_content_length`` truncates a chunked request body, the
+    stream stops at a chunk boundary instead of in the middle of a chunk,
+    so the remaining data is not misinterpreted as the next request.
 -   Drop support for Python 3.9 and 3.10. :pr:`3098`
 -   Remove previous deprecated code: :pr:`3099`
 

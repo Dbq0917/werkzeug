@@ -110,6 +110,51 @@ class DechunkedInput(io.RawIOBase):
             raise OSError("Negative chunk length not allowed")
         return _len
 
+    def snap_to_chunk_boundary(self, size: int) -> int:
+        """Reduce a read size so that it ends on a chunk boundary. Called
+        by :class:`werkzeug.wsgi._LimitedStream` when a limit such as
+        ``max_content_length`` is enforced, so that reaching the limit
+        stops at a chunk boundary instead of leaving the underlying
+        stream in the middle of a chunk.
+
+        Only chunk header lines are read to find the next boundary.
+        Chunk data is never read ahead to align the size.
+
+        :param size: The number of bytes that are allowed to be read.
+        :return: The number of bytes that may be read, ending on a chunk
+            boundary. This is 0 if the next chunk does not fit in
+            ``size``.
+
+        .. versionadded:: 3.2
+        """
+        if self._done:
+            return size
+
+        if self._len == 0:
+            # At a chunk boundary, read the next chunk's header to find
+            # the distance to the next boundary.
+            self._len = self.read_chunk_len()
+
+            if self._len == 0:
+                # The final chunk ends the stream, consume its
+                # terminating newline.
+                self._done = True
+                terminator = self._rfile.readline(2)
+
+                if terminator not in (b"\n", b"\r\n", b"\r"):
+                    raise OSError("Missing chunk terminating newline")
+
+                return size
+
+            if size < self._len:
+                # The next chunk doesn't fit in the size. Stop at the
+                # current boundary rather than cutting the chunk.
+                return 0
+
+        # Stop at the next boundary. Whether the chunk beyond it fits
+        # can only be known once this boundary is reached.
+        return min(size, self._len)
+
     def readinto(self, buf: bytearray) -> int:  # type: ignore[override]
         read = 0
         while not self._done and read < len(buf):

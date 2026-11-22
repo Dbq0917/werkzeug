@@ -532,6 +532,23 @@ class _LimitedStream(io.RawIOBase):
             self.on_exhausted()
             return 0
 
+        # If the wrapped stream is aware of chunk boundaries (such as
+        # DechunkedInput), don't let the limit cut a chunk in half, which
+        # would leave the underlying stream in the middle of a chunk.
+        # Snap the read back to a chunk boundary instead.
+        snap_to_boundary = getattr(self._stream, "snap_to_chunk_boundary", None)
+
+        if snap_to_boundary is not None:
+            try:
+                remaining = snap_to_boundary(remaining)
+            except (OSError, ValueError) as e:
+                self.on_disconnect(error=e)
+                return 0
+
+            if remaining <= 0:
+                self.on_exhausted()
+                return 0
+
         if hasattr(self._stream, "readinto"):
             # Use stream.readinto if it's available.
             if size <= remaining:
