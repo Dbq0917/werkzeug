@@ -3,6 +3,11 @@
 Version 3.2.0
 -------------
 
+-   The request body stream is spooled to a temporary file as it is read, and
+    can be seeked back to read the body again. For example, middleware can
+    read the body to verify a signature, then the view can read it again. The
+    body is kept in memory up to the new ``Request.max_stream_memory_size``
+    (500kB by default), after that it is moved to disk.
 -   Drop support for Python 3.9 and 3.10. :pr:`3098`
 -   Remove previous deprecated code: :pr:`3099`
 

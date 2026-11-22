@@ -13,7 +13,10 @@ in a request.
     and return the raw bytes. However, ``data`` will be empty if it was actually
     form data, and ``form`` and ``files`` will be populated instead.
 
-All of these read from :attr:`.Request.stream`, which can only be consumed once.
+All of these read from :attr:`.Request.stream`. Everything read from the
+stream is spooled to a temporary file, so it can be seeked back and read
+again. The data is kept in memory up to
+:attr:`~.Request.max_stream_memory_size`, after that it is moved to disk.
 However, all of these cache their data by default, so they can be accessed
 multiple times even though the stream remains consumed.
 
@@ -87,12 +90,25 @@ be prepared to handle infinite streams.
 Reading the Stream in Middleware
 --------------------------------
 
-When writing WSGI middleware, it is important to remember that the input stream
-can only be read once. If middleware reads it, it will not be available to the
-application.
+Middleware may need to read the request body, for example to verify a
+signature, before passing the request to the wrapped application. Everything
+read from :attr:`~.Request.stream` is spooled to a temporary file, so the
+stream can be seeked back and passed on without keeping the entire body in
+memory.
 
-Most middleware should not need to read the stream. In rare cases where it does,
-you can replace the stream with what you've read to avoid this in some cases.
+.. code-block:: python
+
+    def middleware(environ, start_response):
+        request = Request(environ)
+        check_signature(request.get_data())
+        request.stream.seek(0)
+        environ["wsgi.input"] = request.stream
+        return wrapped_app(environ, start_response)
+
+The body is kept in memory up to :attr:`~.Request.max_stream_memory_size`,
+after that it is moved to a temporary file on disk.
+
+Alternatively, you can replace the stream with what you've read.
 
 .. code-block:: python
 

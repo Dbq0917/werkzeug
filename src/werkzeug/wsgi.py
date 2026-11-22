@@ -5,6 +5,7 @@ import typing as t
 import wsgiref.types as wt
 from functools import partial
 from functools import update_wrapper
+from tempfile import SpooledTemporaryFile
 
 from ._internal import _wsgi_decoding_dance
 from .exceptions import ClientDisconnected
@@ -604,6 +605,105 @@ class _LimitedStream(io.RawIOBase):
 
     def readable(self) -> bool:
         return True
+
+
+class _SpooledStream(io.RawIOBase):
+    """Wrap a stream so that everything read from it is also written to a
+    temporary file, allowing the data to be re-read without keeping it all in
+    memory.
+
+    Data is kept in memory up to ``max_in_memory`` bytes, after that the
+    temporary file is moved to disk. Seeking back within the data that has
+    already been read is supported. Reading after seeking back replays the
+    spooled data, then continues reading the wrapped stream.
+
+    :param stream: The stream to read from.
+    :param max_in_memory: Keep at most this many bytes in memory, larger data
+        is moved to a temporary file on disk. ``None`` means no limit, the
+        data is never moved to disk.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(self, stream: t.IO[bytes], max_in_memory: int | None) -> None:
+        self._stream = stream
+
+        if max_in_memory is None:
+            self._spool: t.IO[bytes] = io.BytesIO()
+        else:
+            self._spool = SpooledTemporaryFile(max_size=max_in_memory, mode="w+b")
+
+        self._pos = 0
+        self._spooled = 0
+        self._eof = False
+
+    def readinto(self, b: bytearray | memoryview) -> int:  # type: ignore[override]
+        size = len(b)
+        out_size = 0
+
+        # The position was seeked back, replay data that was already read.
+        if self._pos < self._spooled:
+            self._spool.seek(self._pos)
+            data = self._spool.read(min(size, self._spooled - self._pos))
+            out_size = len(data)
+            b[:out_size] = data
+            self._pos += out_size
+
+        if out_size < size and not self._eof:
+            remaining = memoryview(b)[out_size:]
+
+            if hasattr(self._stream, "readinto"):
+                live_size = self._stream.readinto(remaining)
+            else:
+                data = self._stream.read(size - out_size)
+                live_size = len(data)
+                remaining[:live_size] = data
+
+            if not live_size:
+                self._eof = True
+            else:
+                self._spool.seek(0, io.SEEK_END)
+                self._spool.write(remaining[:live_size])
+                self._spooled += live_size
+                self._pos += live_size
+                out_size += live_size
+
+        return out_size
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        """Seek within the data that has been read so far. Seeking past that
+        point is not possible, as the remaining data has not been read from
+        the wrapped stream yet.
+        """
+        if whence == io.SEEK_SET:
+            pos = offset
+        elif whence == io.SEEK_CUR:
+            pos = self._pos + offset
+        elif whence == io.SEEK_END:
+            pos = self._spooled + offset
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+
+        if not 0 <= pos <= self._spooled:
+            raise io.UnsupportedOperation(
+                "Cannot seek past the data that has been read so far."
+            )
+
+        self._pos = pos
+        return pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self._spool.close()
+        super().close()
 
 
 if not t.TYPE_CHECKING:

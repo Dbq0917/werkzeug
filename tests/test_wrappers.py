@@ -21,6 +21,7 @@ from werkzeug.test import Client
 from werkzeug.test import create_environ
 from werkzeug.test import run_wsgi_app
 from werkzeug.wsgi import _LimitedStream
+from werkzeug.wsgi import _SpooledStream
 
 
 def assert_environ(environ, method):
@@ -497,6 +498,89 @@ def test_get_data_method_parsing_caching_behavior():
     assert req.form["foo"] == "Hello World"
 
 
+def test_get_data_spooled_to_disk():
+    # A body larger than max_stream_memory_size is moved to a temporary file
+    # on disk instead of being kept in memory, and can still be re-read.
+    data = b"foo=Hello+World"
+    req = wrappers.Request.from_values(
+        "/", method="POST", data=data, content_type="application/x-www-form-urlencoded"
+    )
+    req.max_stream_memory_size = 4
+
+    assert req.get_data() == data
+    assert req.stream._spool._rolled
+    assert req.form["foo"] == "Hello World"
+    assert req.get_data() == data
+    req.close()
+
+
+def test_middleware_passes_read_stream_to_view():
+    # Middleware reads the body, for example to verify a signature, then
+    # replaces the input stream so the view can read it again. The body is
+    # spooled to disk rather than kept in memory.
+    data = b"foo=Hello+World"
+    req = wrappers.Request.from_values(
+        "/", method="POST", data=data, content_type="application/x-www-form-urlencoded"
+    )
+    req.max_stream_memory_size = 4
+
+    assert req.get_data() == data
+    req.stream.seek(0)
+
+    environ = dict(req.environ)
+    environ["wsgi.input"] = req.stream
+    view_req = wrappers.Request(environ)
+    assert view_req.form["foo"] == "Hello World"
+    req.close()
+
+
+def test_stream_seek_reread():
+    data = b"Hello World"
+    req = wrappers.Request.from_values(
+        "/", method="POST", data=data, content_type="text/plain"
+    )
+    stream = req.stream
+
+    assert stream.read(5) == b"Hello"
+    stream.seek(0)
+    assert stream.read(6) == b"Hello "
+    assert stream.read() == b"World"
+    assert stream.read() == b""
+
+    # Can seek within the data that has been read, but not past it.
+    stream.seek(0)
+    assert stream.read() == data
+    assert stream.seek(0, 2) == len(data)
+
+    with pytest.raises(IOError):
+        stream.seek(len(data) + 1)
+
+
+def test_reread_large_multipart_upload():
+    file_data = b"x" * 1_000_000
+    data = (
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="test.bin"\r\n'
+        b"Content-Type: application/octet-stream\r\n"
+        b"\r\n" + file_data + b"\r\n"
+        b"--boundary--\r\n"
+    )
+    req = wrappers.Request.from_values(
+        "/",
+        method="POST",
+        data=data,
+        content_type="multipart/form-data; boundary=boundary",
+    )
+    req.max_stream_memory_size = 1024
+
+    # The gateway reads the body to verify a signature, the view still sees
+    # the complete upload.
+    assert req.get_data() == data
+    assert req.stream._spool._rolled
+    assert req.files["file"].stream.read() == file_data
+    req.close()
+
+
 def test_authenticate():
     resp = wrappers.Response()
     resp.www_authenticate.type = "basic"
@@ -738,7 +822,8 @@ def test_other_method_payload():
         method="MADE_UP",
     )
     assert req.data == data
-    assert isinstance(req.stream, _LimitedStream)
+    assert isinstance(req.stream, _SpooledStream)
+    assert isinstance(req.stream._stream, _LimitedStream)
 
 
 def test_urlfication():

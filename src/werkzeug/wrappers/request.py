@@ -25,6 +25,7 @@ from ..utils import cached_property
 from ..wsgi import _FileWrapper
 from ..wsgi import _get_server
 from ..wsgi import _LimitedStream
+from ..wsgi import _SpooledStream
 
 T = t.TypeVar("T")
 
@@ -99,6 +100,19 @@ class Request(_SansIORequest):
         Defaults to 500kb instead of unlimited.
 
     .. versionadded:: 0.5
+    """
+
+    max_stream_memory_size: int | None = 500_000
+    """Keep at most this many bytes of the request body in memory while
+    reading :attr:`stream`. Larger bodies are spooled to a temporary file on
+    disk, so that the body can be re-read without loading it entirely into
+    memory. The default is 500kB. ``None`` means no limit, the body is never
+    moved to disk.
+
+    This is not a limit on the size of the body, use
+    :attr:`max_content_length` for that.
+
+    .. versionadded:: 3.2
     """
 
     max_form_parts = 1000
@@ -473,10 +487,13 @@ class Request(_SansIORequest):
         return self._private_get_stream_for_parsing()
 
     def _private_get_stream_for_parsing(self) -> t.IO[bytes]:
-        if self._cached_data is not None:
-            return BytesIO(self._cached_data)
+        stream = self.stream
 
-        return self.stream
+        if self._body_cached and isinstance(stream, _SpooledStream):
+            # The body was already read and spooled by 'get_data', replay it.
+            stream.seek(0)
+
+        return stream
 
     def close(self) -> None:
         """Closes associated resources of this request object.  This
@@ -488,6 +505,11 @@ class Request(_SansIORequest):
         files = self.__dict__.get("files")
         for _key, value in iter_multi_items(files or ()):
             value.close()
+
+        stream = self.__dict__.get("stream")
+
+        if isinstance(stream, _SpooledStream):
+            stream.close()
 
     def __enter__(self) -> Request:
         return self
@@ -526,7 +548,16 @@ class Request(_SansIORequest):
         handles this, clients may show a "connection reset" failure instead of
         seeing the 413 response.
 
+        Everything read from the stream is spooled to a temporary file, so the
+        stream can be seeked back and read again, for example if middleware
+        read the body before the view. Data is kept in memory up to
+        :attr:`max_stream_memory_size`, after that it is moved to disk.
+
         :raise .RequestEntityTooLarge: If :attr:`max_content_length` is exceeded.
+
+        .. versionchanged:: 3.2
+            The stream is spooled to a temporary file as it is read, and can
+            be seeked back to re-read the data.
 
         .. versionchanged:: 2.3.2
             ``max_content_length`` is only applied to requests if the server
@@ -545,7 +576,7 @@ class Request(_SansIORequest):
                 " from the input stream is disabled."
             )
 
-        stream: t.IO[bytes] = self.environ["wsgi.input"]
+        input_stream: t.IO[bytes] = self.environ["wsgi.input"]
 
         if (
             self.content_length is not None
@@ -563,15 +594,19 @@ class Request(_SansIORequest):
                 # read attempt is made when the client sends no data. For
                 # example, the development server does not handle buffering
                 # except for chunked encoding.
-                return _LimitedStream(stream, self.max_content_length, is_max=True)  # type: ignore[return-value]
-
-            return stream
+                input_stream = _LimitedStream(  # type: ignore[assignment]
+                    input_stream, self.max_content_length, is_max=True
+                )
 
         # No limit given, stream can't be read safely, return empty.
-        if self.content_length is None:
-            return BytesIO()
+        elif self.content_length is None:
+            input_stream = BytesIO()
+        else:
+            input_stream = _LimitedStream(  # type: ignore[assignment]
+                input_stream, self.content_length
+            )
 
-        return _LimitedStream(stream, self.content_length)  # type: ignore[return-value]
+        return _SpooledStream(input_stream, self.max_stream_memory_size)  # type: ignore[return-value]
 
     @property
     def input_stream(self) -> t.IO[bytes]:
@@ -607,7 +642,7 @@ class Request(_SansIORequest):
         """
         return self.get_data(parse_form_data=True)
 
-    _cached_data: bytes | None = None
+    _body_cached: bool = False
 
     @t.overload
     def get_data(
@@ -648,16 +683,29 @@ class Request(_SansIORequest):
             :attr:`files`. :attr:`data` is a shortcut for this.
         :raise .RequestEntityTooLarge: If :attr:`max_content_length` is exceeded.
 
+        .. versionchanged:: 3.2
+            The cached data is spooled to a temporary file instead of being
+            kept in memory, see :attr:`max_stream_memory_size`.
+
         .. versionadded:: 0.9
         """
-        if (data := self._cached_data) is None:
-            if parse_form_data:
-                self._load_form_data()
+        if parse_form_data:
+            self._load_form_data()
 
-            data = self.stream.read()
+        stream = self.stream
 
-            if cache:
-                self._cached_data = data
+        if cache and isinstance(stream, _SpooledStream):
+            if stream.tell() == 0:
+                # Nothing has been read yet, everything the stream reads can
+                # be spooled and replayed.
+                self._body_cached = True
+
+            if self._body_cached:
+                # Read the entire body from the start, spooling any remaining
+                # data, so that it can be read again.
+                stream.seek(0)
+
+        data = stream.read()
 
         if as_text:
             return data.decode(errors="replace")
